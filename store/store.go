@@ -2,25 +2,25 @@ package store
 
 import (
 	"fmt"
+	"regexp"
 	"sync"
 
+	"github.com/jtblin/kube2iam/iam"
 	log "github.com/sirupsen/logrus"
 	"k8s.io/client-go/pkg/api/v1"
-
-	"github.com/jtblin/kube2iam/iam"
 )
 
 // Store implements the k8s framework ResourceEventHandler interface.
 type Store struct {
-	defaultRole          string
-	IamRoleKey           string
-	NamespaceKey         string
-	namespaceRestriction bool
-	mutex                sync.RWMutex
-	rolesByIP            map[string]string
-	rolesByNamespace     map[string][]string
-	namespaceByIP        map[string]string
-	iam                  *iam.Client
+	defaultRole            string
+	IamRoleKey             string
+	NamespaceKey           string
+	namespaceRestriction   bool
+	mutex                  sync.RWMutex
+	rolesByIP              map[string]string
+	rolesRegexpByNamespace map[string][]*regexp.Regexp
+	namespaceByIP          map[string]string
+	iam                    *iam.Client
 }
 
 // Get returns the iam role based on IP address.
@@ -37,14 +37,12 @@ func (s *Store) Get(IP string) (string, error) {
 	return "", fmt.Errorf("Unable to find role for IP %s", IP)
 }
 
-// AddRoleToIP caches the role for the given IP address.
 func (s *Store) AddRoleToIP(pod *v1.Pod, role string) {
 	s.mutex.Lock()
 	s.rolesByIP[pod.Status.PodIP] = role
 	s.mutex.Unlock()
 }
 
-// AddNamespaceToIP caches the namespace for the given IP address.
 func (s *Store) AddNamespaceToIP(pod *v1.Pod) {
 	namespace := pod.GetNamespace()
 	s.mutex.Lock()
@@ -61,61 +59,66 @@ func (s *Store) DeleteIP(ip string) {
 }
 
 // AddRoleToNamespace takes a role name and adds it to our internal state
-func (s *Store) AddRoleToNamespace(namespace string, role string) {
+func (s *Store) AddRoleToNamespace(namespace string, regexpForRole string) {
 	// Make sure to add the full ARN of roles to ensure string matching works
-	roleARN := s.iam.RoleARN(role)
+	regexpRoleARN := s.iam.RoleARN(regexpForRole)
 
-	ar := s.rolesByNamespace[namespace]
+	ar := s.rolesRegexpByNamespace[namespace]
 
-	// this is a tiny bit troubling, we could go with a the rolesByNamespace
+	// this is a tiny bit troubling, we could go with a the rolesRegexpByNamespace
 	// being a map[string]map[string]bool so that deduplication isn't
 	// ever a problem .. but for now...
 	c := true
 	for i := range ar {
-		if ar[i] == roleARN {
+		if ar[i].String() == regexpRoleARN {
 			c = false
 			break
 		}
 	}
 	if c {
-		ar = append(ar, roleARN)
+		re, err := regexp.Compile(regexpRoleARN)
+		if err != nil {
+			log.Debugf("Invalid regexp %s  described on namespace:%s found.", regexpRoleARN, namespace)
+			return
+		}
+		ar = append(ar, re)
 	}
 	s.mutex.Lock()
-	s.rolesByNamespace[namespace] = ar
+	s.rolesRegexpByNamespace[namespace] = ar
 	s.mutex.Unlock()
 }
 
 // RemoveRoleFromNamespace takes a role and removes it from a namespace mapping
-func (s *Store) RemoveRoleFromNamespace(namespace string, role string) {
+func (s *Store) RemoveRoleFromNamespace(namespace string, regexpForRole string) {
 	// Make sure to remove the full ARN of roles to ensure string matching works
-	roleARN := s.iam.RoleARN(role)
+	regexpRoleARN := s.iam.RoleARN(regexpForRole)
 
-	ar := s.rolesByNamespace[namespace]
+	ar := s.rolesRegexpByNamespace[namespace]
 	for i := range ar {
-		if ar[i] == roleARN {
+		if ar[i].String() == regexpRoleARN {
 			ar = append(ar[:i], ar[i+1:]...)
 			break
 		}
 	}
 	s.mutex.Lock()
-	s.rolesByNamespace[namespace] = ar
+	s.rolesRegexpByNamespace[namespace] = ar
 	s.mutex.Unlock()
 }
 
 // DeleteNamespace removes all role mappings from a namespace
 func (s *Store) DeleteNamespace(namespace string) {
 	s.mutex.Lock()
-	delete(s.rolesByNamespace, namespace)
+	delete(s.rolesRegexpByNamespace, namespace)
 	s.mutex.Unlock()
 }
 
 // checkRoleForNamespace checks the 'database' for a role allowed in a namespace,
 // returns true if the role is found, otheriwse false
 func (s *Store) checkRoleForNamespace(role string, namespace string) bool {
-	ar := s.rolesByNamespace[namespace]
+	ar := s.rolesRegexpByNamespace[namespace]
 	for _, r := range ar {
-		if r == role {
-			log.Debugf("Role:%s on namespace:%s found.", role, namespace)
+		if r.MatchString(role) {
+			log.Debugf("Role:%s matching regexp %s on namespace:%s found.", role, r, namespace)
 			return true
 		}
 	}
@@ -147,7 +150,16 @@ func (s *Store) DumpRolesByIP() map[string]string {
 
 // DumpRolesByNamespace outputs all the roles by namespace.
 func (s *Store) DumpRolesByNamespace() map[string][]string {
-	return s.rolesByNamespace
+	rolesByNamespace := make(map[string][]string)
+
+	for ns, listOfRegexp := range s.rolesRegexpByNamespace {
+		listOfRoles := make([]string, len(s.rolesRegexpByNamespace[ns]))
+		for _, roleRegexp := range listOfRegexp {
+			listOfRoles = append(listOfRoles, roleRegexp.String())
+		}
+		rolesByNamespace[ns] = listOfRoles
+	}
+	return rolesByNamespace
 }
 
 // DumpNamespaceByIP outputs all the namespaces by IP address.
@@ -155,16 +167,15 @@ func (s *Store) DumpNamespaceByIP() map[string]string {
 	return s.namespaceByIP
 }
 
-// NewStore returns a new Store for iam roles.
 func NewStore(key string, defaultRole string, namespaceRestriction bool, namespaceKey string, iamInstance *iam.Client) *Store {
 	return &Store{
-		defaultRole:          defaultRole,
-		IamRoleKey:           key,
-		NamespaceKey:         namespaceKey,
-		namespaceRestriction: namespaceRestriction,
-		rolesByIP:            make(map[string]string),
-		rolesByNamespace:     make(map[string][]string),
-		namespaceByIP:        make(map[string]string),
-		iam:                  iamInstance,
+		defaultRole:            defaultRole,
+		IamRoleKey:             key,
+		NamespaceKey:           namespaceKey,
+		namespaceRestriction:   namespaceRestriction,
+		rolesByIP:              make(map[string]string),
+		rolesRegexpByNamespace: make(map[string][]*regexp.Regexp),
+		namespaceByIP:          make(map[string]string),
+		iam:                    iamInstance,
 	}
 }
